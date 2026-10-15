@@ -10,6 +10,8 @@ isolated database reachable only over Railway's private network.
 mongodb   /data   replica set rs0, one member   ← initiates itself, once
 ```
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/mongodb-9-single-replica-set?referralCode=7Npd7C&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
 ## Why a replica set of one
 
 A standalone `mongod` rejects anything that needs an oplog. Multi-document
