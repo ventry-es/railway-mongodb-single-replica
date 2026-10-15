@@ -1,0 +1,25 @@
+# Local mirror of the Railway service: one node, one volume. It exists so the
+# failure modes this template defends against can be reproduced on a laptop
+# instead of in production — see tests/e2e.sh.
+name: mongo-single-replica-local
+
+services:
+  # MONGO_ADVERTISED_HOST stands in for RAILWAY_PRIVATE_DOMAIN: it is the name
+  # written into the replica set configuration, so it has to be a name that
+  # resolves to this container — never the container's own hostname, which is
+  # an id nothing else can resolve.
+  mongodb:
+    build:
+      context: ./mongo
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      MONGO_REPLICA_SET_NAME: ${MONGO_REPLICA_SET_NAME:?run "cp .env.example .env" first}
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:?run "cp .env.example .env" first}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:?run "cp .env.example .env" first}
+      MONGO_ADVERTISED_HOST: mongodb
+    volumes:
+      - mongodb-data:/data
+
+volumes:
+  mongodb-data:

@@ -1,0 +1,11 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Files that are executed inside Linux containers MUST keep LF endings,
+# otherwise the shebang resolves to `/bin/bash\r` and the image fails to start.
+*.sh        text eol=lf
+*.js        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf

@@ -1,0 +1,10 @@
+# Local development only — never commit real credentials.
+.env
+.env.*
+!.env.example
+
+# Local test volumes
+.data/
+
+# AI
+.claude
