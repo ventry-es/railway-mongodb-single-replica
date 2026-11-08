@@ -29,3 +29,13 @@ First release, not yet published on Railway.
   `requiredMountPath` in `railway.json`.
 - `docker-compose.yml` and `tests/e2e.sh` reproducing each failure mode against
   a real node.
+
+### Fixed
+
+- A redeploy could leave the node in `REMOVED`, with no PRIMARY, when Railway's
+  private DNS still pointed the service's domain at the previous container
+  as `mongod` started. The node now waits for the name to reach it and
+  re-applies its unchanged configuration, then elects itself PRIMARY.
+- The replica set check no longer runs while `mongod` is still loading its
+  configuration. Running it then reported a healthy node as one that "does not
+  recognise itself", with identical hosts on both lines.

@@ -42,10 +42,40 @@ networking; if `MONGO_ADVERTISED_HOST` is set, check that it names this node.
 
 ## The node starts but is never PRIMARY
 
+### `mongod started while X still led to another address`
+
+This is not an error on its own. It is what a redeploy looks like when
+Railway's private DNS still points the service's domain at the previous
+container. The node waits for the name to reach it, re-applies the same
+replica set configuration and elects itself PRIMARY. Look for
+`Replica set configuration re-applied` further down. Nothing needs doing.
+
+### `X did not lead to this node within 300s`, or `Re-applying the replica set configuration failed`
+
+The automatic recovery described above gave up. The data is intact.
+
+Restart the service first: a new `mongod` looks for itself again from scratch.
+If it ends up here again, re-apply the configuration yourself through the
+public endpoint ([Operations](OPERATIONS.md#reaching-the-database-from-outside-railway)):
+
+```sh
+mongosh "$MONGO_PUBLIC_URL" --eval '
+  const conf = db.getSiblingDB("local").system.replset.findOne();
+  conf.version += 1;
+  printjson(db.adminCommand({ replSetReconfig: conf, force: true }));'
+```
+
+This keeps the same member and host and only raises the configuration
+version. While the private domain still leads somewhere else, the command fails
+with `NodeNotFound` and changes nothing.
+
 ### `This node does not recognise itself in its replica set configuration`
 
 The configuration names a different host, or a different replica set, than the
 node is running as. The log box shows both. The data is intact.
+
+If both lines are identical, `mongod` never accepted its configuration during
+the bootstrap timeout. Restart the service.
 
 **Do not run `rs.initiate()`.** It cannot recover a node in this state; on
 MongoDB 9.0 it leaves the node unusable.

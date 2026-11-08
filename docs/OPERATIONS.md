@@ -23,6 +23,14 @@ that is a few seconds in which there is no database.
 
 `mongod` receives `SIGTERM` as PID 1 and shuts down cleanly; the new container
 starts, waits for its private domain to resolve, and elects itself PRIMARY.
+
+Sometimes the private domain still leads to the old container for a while
+after the new one starts. The new node then does not recognise itself at first.
+It waits for the name to catch up, re-applies its unchanged replica set
+configuration and elects itself PRIMARY, which can stretch the gap to a minute
+or two. The logs show `did not recognise itself in the replica set` followed
+by `Replica set configuration re-applied`, and nothing needs doing.
+
 Drivers wait for a server for up to 30 seconds by default
 (`serverSelectionTimeoutMS`) and retry an interrupted operation once, so
 applications usually see a pause rather than errors. Change streams resume on

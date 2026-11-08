@@ -10,7 +10,7 @@
 #   ./tests/e2e.sh          run everything
 #   ./tests/e2e.sh rename   run a single scenario
 #
-# Scenarios: bootstrap features idempotency keyfile password setname rename volume durability
+# Scenarios: bootstrap features idempotency keyfile password setname rename staledns volume durability
 
 set -euo pipefail
 
@@ -20,11 +20,12 @@ readonly NODE_IMAGE="railway-mongodb-single-replica:test"
 readonly NODE=mongodb
 readonly REPLICA_SET=rs0
 
-# The rename scenario needs a name that can stop resolving, which a compose
-# service name never does, so it runs its own container on its own network.
-readonly RENAME_CONTAINER=e2e-rename
-readonly RENAME_NETWORK=e2e-rename
-readonly RENAME_VOLUME=e2e-rename-data
+# The rename and staledns scenarios need a name they control — one that can
+# stop resolving, or lead somewhere else — which a compose service name never
+# does, so they run their own container on their own network.
+readonly FIXTURE_CONTAINER=e2e-fixture
+readonly FIXTURE_NETWORK=e2e-fixture
+readonly FIXTURE_VOLUME=e2e-fixture-data
 
 ROOT_USER="root"
 ROOT_PASSWORD="localdevpassword"
@@ -131,10 +132,10 @@ MONGO_INITDB_ROOT_PASSWORD=${ROOT_PASSWORD}
 EOF
 }
 
-remove_rename_fixture() {
-  docker rm --force "$RENAME_CONTAINER" >/dev/null 2>&1 || true
-  docker network rm "$RENAME_NETWORK" >/dev/null 2>&1 || true
-  docker volume rm "$RENAME_VOLUME" >/dev/null 2>&1 || true
+remove_fixture() {
+  docker rm --force "$FIXTURE_CONTAINER" >/dev/null 2>&1 || true
+  docker network rm "$FIXTURE_NETWORK" >/dev/null 2>&1 || true
+  docker volume rm "$FIXTURE_VOLUME" >/dev/null 2>&1 || true
 }
 
 setup() {
@@ -142,7 +143,7 @@ setup() {
   write_env
 
   compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-  remove_rename_fixture
+  remove_fixture
   compose build --quiet
   docker build --quiet --tag "$NODE_IMAGE" ./mongo >/dev/null
   compose up --detach --wait "$NODE"
@@ -152,7 +153,7 @@ setup() {
 teardown() {
   step "Cleaning up"
   compose down --volumes --remove-orphans >/dev/null 2>&1 || true
-  remove_rename_fixture
+  remove_fixture
   rm -f .env
 }
 
@@ -283,29 +284,36 @@ scenario_setname() {
   wait_until 90 "the node to become PRIMARY" _is_primary || return
 }
 
-_rename_run() {
+# Any arguments after the host go to `docker run` as they are.
+_fixture_run() {
   local host="$1"
-  docker rm --force "$RENAME_CONTAINER" >/dev/null 2>&1 || true
-  docker run --detach --name "$RENAME_CONTAINER" \
-    --network "$RENAME_NETWORK" --network-alias "$host" \
+  shift
+  docker rm --force "$FIXTURE_CONTAINER" >/dev/null 2>&1 || true
+  docker run --detach --name "$FIXTURE_CONTAINER" \
+    --network "$FIXTURE_NETWORK" --network-alias "$host" \
+    "$@" \
     -e MONGO_REPLICA_SET_NAME="$REPLICA_SET" \
     -e MONGO_INITDB_ROOT_USERNAME="$ROOT_USER" \
     -e MONGO_INITDB_ROOT_PASSWORD="$ROOT_PASSWORD" \
     -e MONGO_ADVERTISED_HOST="$host" \
-    -v "${RENAME_VOLUME}:/data" \
+    -v "${FIXTURE_VOLUME}:/data" \
     "$NODE_IMAGE" >/dev/null
 }
 
-_rename_eval() {
+_fixture_eval() {
   local host="$1" script="$2"
-  docker exec "$RENAME_CONTAINER" mongosh --quiet \
+  docker exec "$FIXTURE_CONTAINER" mongosh --quiet \
     "mongodb://${host}:27017/?replicaSet=${REPLICA_SET}&authSource=admin&serverSelectionTimeoutMS=5000" \
     --username "$ROOT_USER" --password "$ROOT_PASSWORD" \
     --eval "$script" 2>/dev/null | tr -d '\r' | tail -n 1
 }
 
-_rename_is_primary() {
-  [[ "$(_rename_eval "$1" 'print(db.hello().isWritablePrimary === true)')" == "true" ]]
+_fixture_is_primary() {
+  [[ "$(_fixture_eval "$1" 'print(db.hello().isWritablePrimary === true)')" == "true" ]]
+}
+
+_fixture_logs_contain() {
+  [[ "$(docker logs "$FIXTURE_CONTAINER" 2>&1)" == *"$1"* ]]
 }
 
 # Renaming the service changes its private domain. The old name stops
@@ -314,33 +322,76 @@ _rename_is_primary() {
 scenario_rename() {
   step "rename — the database follows a renamed service"
 
-  docker network create "$RENAME_NETWORK" >/dev/null
-  docker volume create "$RENAME_VOLUME" >/dev/null
+  docker network create "$FIXTURE_NETWORK" >/dev/null
+  docker volume create "$FIXTURE_VOLUME" >/dev/null
 
-  _rename_run mongo-old
-  wait_until 90 "the node to become PRIMARY as mongo-old" _rename_is_primary mongo-old || return
-  _rename_eval mongo-old \
+  _fixture_run mongo-old
+  wait_until 90 "the node to become PRIMARY as mongo-old" _fixture_is_primary mongo-old || return
+  _fixture_eval mongo-old \
     'db.getSiblingDB("events").tickets.insertOne({ _id: "renamed", sold: 7 }, { writeConcern: { w: "majority" } })' >/dev/null
   info "wrote a document as mongo-old, then recreating the node as mongo-new"
 
-  _rename_run mongo-new
-  wait_until 120 "the node to become PRIMARY as mongo-new" _rename_is_primary mongo-new || return
+  _fixture_run mongo-new
+  wait_until 120 "the node to become PRIMARY as mongo-new" _fixture_is_primary mongo-new || return
   pass "the node is PRIMARY under its new name"
 
-  assert_eq "mongo-new:27017" "$(_rename_eval mongo-new 'print(rs.conf().members[0].host)')" \
+  assert_eq "mongo-new:27017" "$(_fixture_eval mongo-new 'print(rs.conf().members[0].host)')" \
     "the member is registered under the new name"
-  assert_eq "7" "$(_rename_eval mongo-new 'print(db.getSiblingDB("events").tickets.findOne({ _id: "renamed" }).sold)')" \
+  assert_eq "7" "$(_fixture_eval mongo-new 'print(db.getSiblingDB("events").tickets.findOne({ _id: "renamed" }).sold)')" \
     "the document written before the rename is still there"
-  assert_contains "$(docker logs "$RENAME_CONTAINER" 2>&1)" "Member host rewritten from mongo-old:27017 to mongo-new:27017" \
+  assert_contains "$(docker logs "$FIXTURE_CONTAINER" 2>&1)" "Member host rewritten from mongo-old:27017 to mongo-new:27017" \
     "the node reports the move"
 
   # Once moved, the next boot must start straight away, without a standalone.
-  _rename_run mongo-new
-  wait_until 90 "the node to become PRIMARY again" _rename_is_primary mongo-new || return
-  assert_not_contains "$(docker logs "$RENAME_CONTAINER" 2>&1)" "Rewriting the member's host" \
+  _fixture_run mongo-new
+  wait_until 90 "the node to become PRIMARY again" _fixture_is_primary mongo-new || return
+  assert_not_contains "$(docker logs "$FIXTURE_CONTAINER" 2>&1)" "Rewriting the member's host" \
     "the next boot does not rewrite it again"
 
-  remove_rename_fixture
+  remove_fixture
+}
+
+# On a redeploy, Railway starts the new container while the private domain
+# still answers with the address of the one it replaced. mongod cannot find
+# itself in its configuration, settles into REMOVED, and — with no peer to send
+# it a heartbeat — would stay there for good, with no PRIMARY. A hosts entry
+# pointing the name at an address nobody answers on reproduces that exactly.
+scenario_staledns() {
+  step "staledns — a redeploy that outruns DNS still ends with a PRIMARY"
+
+  remove_fixture
+  docker network create "$FIXTURE_NETWORK" >/dev/null
+  docker volume create "$FIXTURE_VOLUME" >/dev/null
+
+  _fixture_run mongo-stale
+  wait_until 90 "the node to become PRIMARY" _fixture_is_primary mongo-stale || return
+  _fixture_eval mongo-stale \
+    'db.getSiblingDB("events").tickets.insertOne({ _id: "stale", sold: 3 }, { writeConcern: { w: "majority" } })' >/dev/null
+  info "wrote a document, then recreating the node while its name still leads elsewhere"
+
+  # 192.0.2.0/24 is reserved for documentation, so nothing answers there: mongod
+  # waits on it and gives up, as it does on a container that no longer exists.
+  _fixture_run mongo-stale --add-host mongo-stale:192.0.2.1
+  wait_until 180 "the node to notice it was left out of its replica set" \
+    _fixture_logs_contain "did not recognise itself in the replica set" || return
+  pass "the node noticed it did not recognise itself"
+  assert_eq "false" "$(docker exec "$FIXTURE_CONTAINER" mongosh --quiet --eval 'print(db.hello().isWritablePrimary === true)' 2>/dev/null | tr -d '\r' | tail -n 1)" \
+    "the node is not PRIMARY while its name leads elsewhere"
+
+  # The record catches up. Docker's DNS answers for the alias again once the
+  # hosts entry is gone; /etc/hosts is a bind mount, so it is rewritten in place.
+  docker exec "$FIXTURE_CONTAINER" sh -c 'grep -v mongo-stale /etc/hosts >/tmp/hosts && cat /tmp/hosts >/etc/hosts'
+  wait_until 120 "the node to become PRIMARY again" _fixture_is_primary mongo-stale || return
+  pass "the node is PRIMARY again, with nothing done by hand"
+
+  assert_eq "mongo-stale:27017" "$(_fixture_eval mongo-stale 'print(rs.conf().members.map((m) => m.host).join(","))')" \
+    "the replica set still has its one member, under the same host"
+  assert_eq "3" "$(_fixture_eval mongo-stale 'print(db.getSiblingDB("events").tickets.findOne({ _id: "stale" }).sold)')" \
+    "the document written before the redeploy is still there"
+  assert_contains "$(docker logs "$FIXTURE_CONTAINER" 2>&1)" "Replica set configuration re-applied" \
+    "the node reports re-applying its configuration"
+
+  remove_fixture
 }
 
 # Without a volume, mongod would write to storage the platform throws away.
@@ -379,7 +430,7 @@ scenario_durability() {
 main() {
   local scenarios=("$@")
   if ((${#scenarios[@]} == 0)); then
-    scenarios=(bootstrap features idempotency keyfile password setname rename volume durability)
+    scenarios=(bootstrap features idempotency keyfile password setname rename staledns volume durability)
   fi
 
   trap teardown EXIT
