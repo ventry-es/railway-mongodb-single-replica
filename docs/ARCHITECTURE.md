@@ -58,8 +58,9 @@ redeploy shuts it down cleanly instead of killing it mid-write.
 7. **Move a renamed member** if the service's name has changed
    (`lib/replicaset.sh`), with a short-lived standalone `mongod`.
 8. **Reconcile the root password** (`lib/password.sh`).
-9. **Initiate the replica set** if it has never been initiated
-   (`lib/replicaset.sh`), in the background.
+9. **Initiate the replica set** if it has never been initiated, or **rejoin
+   it** if `mongod` started while its name still led to the previous
+   container (`lib/replicaset.sh`), in the background.
 10. **`exec docker-entrypoint.sh mongod …`**, handing the process over to the
     official image so its first-boot user creation still works.
 
@@ -128,7 +129,7 @@ password is just changing the variable and redeploying.
 ### 4. `rs.initiate()` cannot run twice
 
 Re-initiating a configured replica set throws away its identity. The node only
-initiates when `rs.conf()` reports `NotYetInitialized` (code 94) **and**
+initiates when `rs.status()` reports `NotYetInitialized` (code 94) **and**
 `local.system.replset` is empty.
 
 The second condition is not belt and braces. A node that has a configuration
@@ -181,7 +182,7 @@ from the first boot, and `mongod` is always started with that one. If
 original name and logs why — the database stays up, and only clients that use
 the new name are affected.
 
-### 7. `mongod` never starts before its own name resolves
+### 7. `mongod` finds itself under its own name
 
 `mongod` works out which configured member it is by resolving the hosts in its
 configuration as it starts. If its own name does not resolve at that moment it
@@ -190,6 +191,41 @@ name starts resolving. In a larger set a peer's heartbeat would eventually
 prompt it; a single member has no peers. Railway's private DNS can trail a
 container's start, so the entrypoint waits for `getent hosts` to answer before
 starting `mongod`, and restarts the service if it never does.
+
+Resolving is not enough, though. On a redeploy the private domain can keep
+answering with the *previous* container's address for a while. `getent` is
+satisfied, `mongod` tries to reach itself at an address where nothing answers
+any more, gives up after about 30 seconds, and settles into `REMOVED`:
+
+```
+Locally stored replica set configuration does not have a valid entry for the current node; waiting for reconfig or remote heartbeat
+This node is not a member of the config
+```
+
+The configuration is accepted, unlike after a rename (§5), and is perfectly
+correct; the node simply missed itself. A single member never receives the
+heartbeat it is waiting for, so it would stay there for good. Nothing can be
+checked before `mongod` is listening, so the recovery happens after it starts:
+
+- `rs.status()` failing with `InvalidReplicaSetConfig` (93) while the
+  configuration's only member is exactly the advertised host is that case
+  and nothing else. Anything else gets the "does not recognise itself" error
+  box.
+- The entrypoint waits until connecting to that host reaches this very
+  process. It compares `hello().topologyVersion.processId` between localhost
+  and the private domain, which is how `mongod` answers the same question.
+- It then re-applies the stored configuration unchanged with
+  `replSetReconfig({ force: true })`. `mongod` looks for itself again, finds
+  itself, and elects itself PRIMARY. Only the version changes. The reconfig
+  has to be forced because only a PRIMARY may reconfigure normally. With one
+  member there is nothing to roll back, so forcing it is harmless.
+
+The check also waits for `mongod` to finish loading its configuration first.
+While it does, `mongod` reports `NotYetInitialized` exactly like a node that
+will never accept its configuration, so judging it too early misdiagnoses a
+healthy boot. `rs.initiate()` makes the same name-reaches-this-node check
+before it runs, because a service recreated under a just-deleted service's
+name can inherit that service's stale address.
 
 ### 8. The image is pinned
 

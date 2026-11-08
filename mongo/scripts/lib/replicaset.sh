@@ -11,7 +11,8 @@
 #
 # Defence #5: renaming the service does not strand the database.
 # Defence #6: the replica set name is fixed by the first boot.
-# Defence #7: mongod never starts before its own name resolves.
+# Defence #7: mongod never starts before its own name resolves, and a node
+# that started while the name still led to its predecessor is brought back.
 #
 # Bootstrapping happens inside the node because keyfile authentication is on
 # from the first byte, and MongoDB's localhost exception is the only way to
@@ -57,6 +58,11 @@ pin_replica_set_name() {
 # again when the name starts resolving — in a larger set a peer's heartbeat
 # would eventually prompt it, but a single member has no peers. Railway's
 # private DNS can trail a container's start, so wait for it.
+#
+# Resolving is all that can be checked before mongod is listening, and it is
+# not the same as resolving to this container: on a redeploy the name keeps
+# leading to the container this one replaced for a while. ensure_replica_set
+# recovers from that once mongod is up (see _rejoin_replica_set).
 wait_for_own_name() {
   local host="$1" deadline
   deadline=$(($(date +%s) + DNS_TIMEOUT_SEC))
@@ -178,11 +184,21 @@ adopt_renamed_host() {
 
 # Always succeeds: this runs inside a background task under `set -e`, and a
 # mongosh that exits non-zero must produce a state to report, not kill the task.
+#
+# rs.status() decides whether this node is a member, because rs.conf() cannot:
+# a node holding a configuration it is not part of still returns it. When
+# rs.status() fails, its error and whether local.system.replset holds a
+# configuration tell the rest apart:
+#   94 NotYetInitialized, nothing stored  the set was never created;
+#   94 NotYetInitialized, stored          mongod has not accepted it (yet);
+#   93 InvalidReplicaSetConfig            accepted, but this node is not in it.
 _replica_set_state() {
   local password="$1" self_host="$2" output
   output="$(mongo_eval_local_auth "$password" "
+    const describe = (conf) => conf._id + ' ' + conf.members.map((m) => m.host).join(',');
     let state;
     try {
+      rs.status();
       const conf = rs.conf();
       if (conf.members.length !== 1) {
         state = 'multi-member';
@@ -192,16 +208,13 @@ _replica_set_state() {
         state = 'registered-as ' + conf.members[0].host;
       }
     } catch (error) {
-      if (error.code !== 94) {
-        state = 'error: ' + (error.codeName || error.message);
+      const conf = db.getSiblingDB('local').system.replset.findOne();
+      if (error.code === 94) {
+        state = conf ? 'loading ' + describe(conf) : 'uninitialised';
+      } else if (error.code === 93 && conf) {
+        state = 'removed ' + describe(conf);
       } else {
-        // NotYetInitialized also describes a node that has a configuration but
-        // cannot find itself in it. Only an empty system.replset means the set
-        // was never created.
-        const conf = db.getSiblingDB('local').system.replset.findOne();
-        state = conf
-          ? 'unrecognised ' + conf._id + ' ' + conf.members.map((m) => m.host).join(',')
-          : 'uninitialised';
+        state = 'error: ' + (error.codeName || error.message);
       }
     }
     print(state);
@@ -209,8 +222,61 @@ _replica_set_state() {
   printf '%s' "${output:-error: no response from mongod}"
 }
 
+# mongod answers hello() before it has finished loading its configuration, and
+# loading it means resolving and contacting each member's host — half a minute
+# when that host does not answer. Until then it reports NotYetInitialized, as
+# if the configuration were one it will never accept, so judging the node in
+# that window gets it wrong. Wait for mongod to make up its mind; a
+# configuration still not accepted when the timeout runs out never will be.
+_settled_replica_set_state() {
+  local password="$1" self_host="$2" deadline state
+  deadline=$(($(date +%s) + BOOTSTRAP_TIMEOUT_SEC))
+
+  while :; do
+    state="$(_replica_set_state "$password" "$self_host")"
+    if [[ "$state" != "loading "* ]] || (($(date +%s) >= deadline)); then
+      printf '%s' "$state"
+      return 0
+    fi
+    sleep 2
+  done
+}
+
+# Whether connecting to self_host reaches this very mongod. It is the question
+# mongod asks of a configured host when it looks for itself, answered the same
+# way: by comparing process ids. A name that merely resolves may still lead to
+# the container this one replaced.
+_name_reaches_self() {
+  local self_host="$1" probe here there
+  probe='print(db.hello().topologyVersion.processId.toHexString())'
+
+  here="$(mongo_eval_local "$probe" | tail -n 1)" || return 1
+  there="$(mongosh --quiet \
+    "mongodb://${self_host}/?directConnection=true&connectTimeoutMS=2000&serverSelectionTimeoutMS=2000" \
+    --eval "$probe" 2>/dev/null | tail -n 1)" || return 1
+
+  [[ -n "$here" && "$here" == "$there" ]]
+}
+
+_wait_for_name_to_reach_self() {
+  local self_host="$1" timeout="$2" deadline
+  deadline=$(($(date +%s) + timeout))
+
+  until _name_reaches_self "$self_host"; do
+    (($(date +%s) < deadline)) || return 1
+    sleep 2
+  done
+}
+
 _initiate() {
   local self_host="$1" password="$2" sentinel="$3" script
+
+  # rs.initiate() looks for this node under self_host and fails outright if the
+  # name leads elsewhere, which it can for a while when a service is recreated
+  # under the name of one that was just deleted.
+  if ! _wait_for_name_to_reach_self "$self_host" "$DNS_TIMEOUT_SEC"; then
+    log_warn "${self_host} does not lead to this node yet; trying rs.initiate() anyway."
+  fi
 
   log_info "Initiating replica set '${REPLICA_SET_NAME}' with a single member: ${self_host}."
 
@@ -260,6 +326,59 @@ _move_member_host() {
   write_state_file "$sentinel" "$self_host"
 }
 
+# Reached when mongod has accepted a configuration that names exactly this
+# node, under the name it advertises, and still did not find itself in it:
+# when it looked, the name led somewhere else. On Railway that is a redeploy,
+# with the private domain still answering with the previous container's
+# address.
+#
+# mongod then settles into REMOVED, "waiting for reconfig or remote heartbeat".
+# A single member never receives a heartbeat, so it would wait forever, with
+# the data intact and no PRIMARY. Give it the reconfig instead: once the name
+# reaches this process, re-applying the very same configuration makes mongod
+# look for itself again, find itself, and elect itself PRIMARY. Only the
+# version changes. It has to be forced because only a PRIMARY may reconfigure
+# normally, which is harmless here: one member, nothing to roll back.
+_rejoin_replica_set() {
+  local self_host="$1" password="$2" sentinel="$3" result
+
+  log_warn "mongod started while ${self_host} still led to another address, so it did not recognise itself in the replica set."
+  log_info "Waiting for ${self_host} to lead to this node, then re-applying the same replica set configuration."
+
+  if ! _wait_for_name_to_reach_self "$self_host" "$BOOTSTRAP_TIMEOUT_SEC"; then
+    log_box ERROR \
+      "${self_host} did not lead to this node within ${BOOTSTRAP_TIMEOUT_SEC}s, so it could" \
+      "not rejoin its replica set and there is no PRIMARY. The data is intact." \
+      "Restart the service, and see docs/TROUBLESHOOTING.md if that does not" \
+      "help. Do NOT delete the volume, and do NOT run rs.initiate()."
+    return 1
+  fi
+
+  result="$(mongo_eval_local_auth "$password" "
+    const conf = db.getSiblingDB('local').system.replset.findOne();
+    conf.version += 1;
+    let result;
+    try {
+      const reply = db.adminCommand({ replSetReconfig: conf, force: true });
+      result = reply.ok === 1 ? 'reconfigured' : 'error: ' + (reply.codeName || reply.errmsg);
+    } catch (error) {
+      result = 'error: ' + (error.codeName || error.message);
+    }
+    print(result);
+  " | tail -n 1)" || true
+
+  if [[ "$result" != "reconfigured" ]]; then
+    log_box ERROR \
+      "Re-applying the replica set configuration failed (${result:-no response})." \
+      "The data is intact. Restart the service, and see docs/TROUBLESHOOTING.md" \
+      "if that does not help. Do NOT delete the volume, and do NOT run rs.initiate()."
+    return 1
+  fi
+
+  write_state_file "$sentinel" "$self_host"
+  log_info "Replica set configuration re-applied; this node recognises itself as ${self_host} again."
+}
+
 ensure_replica_set() {
   local self_host="$1" password="$2" sentinel="$3" state
 
@@ -268,7 +387,7 @@ ensure_replica_set() {
     return 0
   fi
 
-  state="$(_replica_set_state "$password" "$self_host")"
+  state="$(_settled_replica_set_state "$password" "$self_host")"
 
   case "$state" in
     configured)
@@ -288,10 +407,13 @@ ensure_replica_set() {
       log_info "Replica set '${REPLICA_SET_NAME}' has more than one member; its topology is managed by hand, so it is left untouched."
       return 0
       ;;
-    "unrecognised "*)
+    "removed ${REPLICA_SET_NAME} ${self_host}")
+      _rejoin_replica_set "$self_host" "$password" "$sentinel" || return 0
+      ;;
+    "removed "* | "loading "*)
       log_box ERROR \
         "This node does not recognise itself in its replica set configuration." \
-        "  configured: ${state#unrecognised }" \
+        "  configured: ${state#* }" \
         "  this node:  ${REPLICA_SET_NAME} ${self_host}" \
         "The data is intact. See docs/TROUBLESHOOTING.md. Do NOT delete the" \
         "volume, and do NOT run rs.initiate() — it cannot recover this state."
