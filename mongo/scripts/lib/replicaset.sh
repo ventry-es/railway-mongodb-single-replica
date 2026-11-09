@@ -20,6 +20,7 @@
 
 readonly BOOTSTRAP_TIMEOUT_SEC="${MONGO_BOOTSTRAP_TIMEOUT_SEC:-300}"
 readonly DNS_TIMEOUT_SEC="${MONGO_DNS_TIMEOUT_SEC:-120}"
+readonly DNS_SETTLE_SEC="${MONGO_DNS_SETTLE_SEC:-60}"
 
 # Set by pin_replica_set_name; the name mongod is actually started with.
 REPLICA_SET_NAME=""
@@ -59,28 +60,59 @@ pin_replica_set_name() {
 # would eventually prompt it, but a single member has no peers. Railway's
 # private DNS can trail a container's start, so wait for it.
 #
-# Resolving is all that can be checked before mongod is listening, and it is
-# not the same as resolving to this container: on a redeploy the name keeps
-# leading to the container this one replaced for a while. ensure_replica_set
-# recovers from that once mongod is up (see _rejoin_replica_set).
+# Resolving is not enough, though: on a redeploy Railway's DNS keeps answering
+# with the previous container's addresses for a few seconds after the new one
+# starts (about nine, observed). mongod that resolves its name in that window
+# spends half a minute trying to reach itself at an address nothing answers on
+# any more, and settles into REMOVED. So also wait — briefly — for the name to
+# resolve to one of this container's own addresses, which is the first thing
+# mongod checks and lets it find itself without connecting anywhere.
+#
+# Behind NAT or a proxy that never happens, so that wait gives up after
+# DNS_SETTLE_SEC rather than failing the boot; ensure_replica_set recovers a
+# node that started too early anyway (see _rejoin_replica_set).
 wait_for_own_name() {
   local host="$1" deadline
   deadline=$(($(date +%s) + DNS_TIMEOUT_SEC))
 
-  getent hosts "$host" >/dev/null && return 0
-  log_info "Waiting for ${host} to resolve before starting mongod ..."
+  if ! getent hosts "$host" >/dev/null; then
+    log_info "Waiting for ${host} to resolve before starting mongod ..."
 
-  until getent hosts "$host" >/dev/null; do
+    until getent hosts "$host" >/dev/null; do
+      if (($(date +%s) >= deadline)); then
+        die "${host} did not resolve within ${DNS_TIMEOUT_SEC}s." \
+          "mongod must resolve its own name to recognise itself in the replica" \
+          "set; starting now would leave the database without a PRIMARY." \
+          "On Railway this is the service's private domain. Anywhere else, check" \
+          "MONGO_ADVERTISED_HOST. The service will restart and try again."
+      fi
+      sleep 1
+    done
+    log_info "  ${host} resolves."
+  fi
+
+  _name_resolves_here "$host" && return 0
+  log_info "${host} does not resolve to this container yet; waiting up to ${DNS_SETTLE_SEC}s for DNS to catch up ..."
+
+  deadline=$(($(date +%s) + DNS_SETTLE_SEC))
+  until _name_resolves_here "$host"; do
     if (($(date +%s) >= deadline)); then
-      die "${host} did not resolve within ${DNS_TIMEOUT_SEC}s." \
-        "mongod must resolve its own name to recognise itself in the replica" \
-        "set; starting now would leave the database without a PRIMARY." \
-        "On Railway this is the service's private domain. Anywhere else, check" \
-        "MONGO_ADVERTISED_HOST. The service will restart and try again."
+      log_warn "${host} still does not resolve to this container; starting mongod anyway."
+      return 0
     fi
     sleep 1
   done
-  log_info "  ${host} resolves."
+  log_info "  ${host} now resolves to this container."
+}
+
+# Whether any address host resolves to belongs to this container — the same
+# test mongod applies first when it looks for itself among its members.
+_name_resolves_here() {
+  local host="$1" own resolved
+  own="$(hostname -I 2>/dev/null | tr -s ' ' '\n' | sed '/^$/d')" || return 1
+  resolved="$(getent ahosts "$host" 2>/dev/null | awk '{ print $1 }' | sort -u)" || return 1
+  [[ -n "$own" && -n "$resolved" ]] || return 1
+  grep -Fxq -f <(printf '%s\n' "$own") <<<"$resolved"
 }
 
 # --------------------------------------------------------- renamed service
@@ -228,13 +260,18 @@ _replica_set_state() {
 # if the configuration were one it will never accept, so judging the node in
 # that window gets it wrong. Wait for mongod to make up its mind; a
 # configuration still not accepted when the timeout runs out never will be.
+#
+# Errors are retried too. When mongod settles on a state it closes every
+# client connection, so a check that happens to be in flight at that moment
+# fails with "connection closed" — on Railway, at exactly the moment a node
+# that missed itself goes REMOVED.
 _settled_replica_set_state() {
   local password="$1" self_host="$2" deadline state
   deadline=$(($(date +%s) + BOOTSTRAP_TIMEOUT_SEC))
 
   while :; do
     state="$(_replica_set_state "$password" "$self_host")"
-    if [[ "$state" != "loading "* ]] || (($(date +%s) >= deadline)); then
+    if [[ "$state" != "loading "* && "$state" != "error: "* ]] || (($(date +%s) >= deadline)); then
       printf '%s' "$state"
       return 0
     fi
@@ -367,7 +404,10 @@ _rejoin_replica_set() {
     print(result);
   " | tail -n 1)" || true
 
-  if [[ "$result" != "reconfigured" ]]; then
+  # The reply can be lost: mongod closes client connections again as it leaves
+  # REMOVED. What counts is whether the node recognises itself now.
+  if [[ "$result" != "reconfigured" &&
+    "$(_settled_replica_set_state "$password" "$self_host")" != "configured" ]]; then
     log_box ERROR \
       "Re-applying the replica set configuration failed (${result:-no response})." \
       "The data is intact. Restart the service, and see docs/TROUBLESHOOTING.md" \

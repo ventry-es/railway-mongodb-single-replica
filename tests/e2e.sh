@@ -351,11 +351,21 @@ scenario_rename() {
   remove_fixture
 }
 
+# The record catches up. Docker's DNS answers for the alias again once the
+# hosts entry is gone; /etc/hosts is a bind mount, so it is rewritten in place.
+_fixture_dns_catches_up() {
+  docker exec "$FIXTURE_CONTAINER" sh -c 'grep -v mongo-stale /etc/hosts >/tmp/hosts && cat /tmp/hosts >/etc/hosts'
+}
+
 # On a redeploy, Railway starts the new container while the private domain
-# still answers with the address of the one it replaced. mongod cannot find
-# itself in its configuration, settles into REMOVED, and — with no peer to send
-# it a heartbeat — would stay there for good, with no PRIMARY. A hosts entry
-# pointing the name at an address nobody answers on reproduces that exactly.
+# still answers with the addresses of the one it replaced — for about nine
+# seconds, as observed. A mongod that resolves its name in that window cannot
+# find itself in its configuration, settles into REMOVED, and — with no peer
+# to send it a heartbeat — would stay there for good, with no PRIMARY.
+#
+# A hosts entry pointing the name at 192.0.2.1 reproduces that. The range is
+# reserved for documentation, so nothing answers there: mongod waits on it and
+# gives up, as it does on a container that no longer exists.
 scenario_staledns() {
   step "staledns — a redeploy that outruns DNS still ends with a PRIMARY"
 
@@ -367,20 +377,35 @@ scenario_staledns() {
   wait_until 90 "the node to become PRIMARY" _fixture_is_primary mongo-stale || return
   _fixture_eval mongo-stale \
     'db.getSiblingDB("events").tickets.insertOne({ _id: "stale", sold: 3 }, { writeConcern: { w: "majority" } })' >/dev/null
-  info "wrote a document, then recreating the node while its name still leads elsewhere"
 
-  # 192.0.2.0/24 is reserved for documentation, so nothing answers there: mongod
-  # waits on it and gives up, as it does on a container that no longer exists.
+  local version_before
+  version_before="$(_fixture_eval mongo-stale 'print(rs.conf().version)')"
+
+  # The usual case: DNS catches up within seconds, before mongod starts.
+  info "recreating the node while its name leads elsewhere, and fixing DNS before mongod starts"
   _fixture_run mongo-stale --add-host mongo-stale:192.0.2.1
+  wait_until 60 "the entrypoint to wait for DNS" \
+    _fixture_logs_contain "does not resolve to this container yet" || return
+  _fixture_dns_catches_up
+  wait_until 90 "the node to become PRIMARY" _fixture_is_primary mongo-stale || return
+  pass "the node is PRIMARY"
+  assert_contains "$(docker logs "$FIXTURE_CONTAINER" 2>&1)" "now resolves to this container" \
+    "mongod started only once its name led to it"
+  assert_not_contains "$(docker logs "$FIXTURE_CONTAINER" 2>&1)" "did not recognise itself" \
+    "mongod recognised itself straight away"
+  assert_eq "$version_before" "$(_fixture_eval mongo-stale 'print(rs.conf().version)')" \
+    "the replica set configuration was not touched"
+
+  # The safety net: DNS catches up only after mongod has started.
+  info "recreating the node and letting mongod start while its name still leads elsewhere"
+  _fixture_run mongo-stale --add-host mongo-stale:192.0.2.1 -e MONGO_DNS_SETTLE_SEC=1
   wait_until 180 "the node to notice it was left out of its replica set" \
     _fixture_logs_contain "did not recognise itself in the replica set" || return
   pass "the node noticed it did not recognise itself"
   assert_eq "false" "$(docker exec "$FIXTURE_CONTAINER" mongosh --quiet --eval 'print(db.hello().isWritablePrimary === true)' 2>/dev/null | tr -d '\r' | tail -n 1)" \
     "the node is not PRIMARY while its name leads elsewhere"
 
-  # The record catches up. Docker's DNS answers for the alias again once the
-  # hosts entry is gone; /etc/hosts is a bind mount, so it is rewritten in place.
-  docker exec "$FIXTURE_CONTAINER" sh -c 'grep -v mongo-stale /etc/hosts >/tmp/hosts && cat /tmp/hosts >/etc/hosts'
+  _fixture_dns_catches_up
   wait_until 120 "the node to become PRIMARY again" _fixture_is_primary mongo-stale || return
   pass "the node is PRIMARY again, with nothing done by hand"
 
@@ -390,6 +415,8 @@ scenario_staledns() {
     "the document written before the redeploy is still there"
   assert_contains "$(docker logs "$FIXTURE_CONTAINER" 2>&1)" "Replica set configuration re-applied" \
     "the node reports re-applying its configuration"
+  assert_not_contains "$(docker logs "$FIXTURE_CONTAINER" 2>&1)" "skipping replica set checks" \
+    "the replica set check did not give up along the way"
 
   remove_fixture
 }
