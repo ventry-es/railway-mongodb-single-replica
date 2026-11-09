@@ -42,12 +42,19 @@ networking; if `MONGO_ADVERTISED_HOST` is set, check that it names this node.
 
 ## The node starts but is never PRIMARY
 
+### `X does not resolve to this container yet`
+
+This is normal on a redeploy. Railway's private DNS keeps returning the
+previous container's addresses for a few seconds, and the entrypoint holds
+`mongod` back until the name points at this container. If it says
+`starting mongod anyway`, the next entry explains what happens after that.
+
 ### `mongod started while X still led to another address`
 
-This is not an error on its own. It is what a redeploy looks like when
-Railway's private DNS still points the service's domain at the previous
-container. The node waits for the name to reach it, re-applies the same
-replica set configuration and elects itself PRIMARY. Look for
+This is not an error on its own. It means `mongod` started before Railway's
+private DNS stopped pointing the service's domain at the previous container.
+The node waits for the name to reach it, re-applies the same replica set
+configuration and elects itself PRIMARY. Look for
 `Replica set configuration re-applied` further down. Nothing needs doing.
 
 ### `X did not lead to this node within 300s`, or `Re-applying the replica set configuration failed`

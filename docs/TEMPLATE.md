@@ -76,6 +76,7 @@ Leave these unset unless you need them.
 | `MONGO_PASSWORD_ROTATION_TIMEOUT_SEC` | `180` | How long a rotation waits for the node to become PRIMARY |
 | `MONGO_BOOTSTRAP_TIMEOUT_SEC` | `300` | How long the replica set checks wait for `mongod` |
 | `MONGO_DNS_TIMEOUT_SEC` | `120` | How long to wait for the node's own name to resolve before restarting |
+| `MONGO_DNS_SETTLE_SEC` | `60` | How long to wait, after it resolves, for the name to resolve to this container before starting `mongod` anyway |
 | `MONGO_ADVERTISED_HOST` | private domain | Override the hostname written into the replica set configuration |
 | `MONGO_EXTRA_FLAGS` | unset | Extra `mongod` flags, appended verbatim |
 | `MONGO_ALLOW_EPHEMERAL_DATA` | `false` | Skip the volume check. Local testing and CI only |

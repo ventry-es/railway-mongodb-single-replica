@@ -39,3 +39,9 @@ First release, not yet published on Railway.
 - The replica set check no longer runs while `mongod` is still loading its
   configuration. Running it then reported a healthy node as one that "does not
   recognise itself", with identical hosts on both lines.
+- `mongod` now waits, up to `MONGO_DNS_SETTLE_SEC` (60 s), for its private
+  domain to resolve to the container's own addresses, so a redeploy no longer
+  reaches `REMOVED` in the usual case.
+- The recovery above gave up when `mongod` closed connections while
+  going `REMOVED` ("connection closed"), leaving the node without a PRIMARY.
+  Connection errors during the check are now retried.

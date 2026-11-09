@@ -192,10 +192,13 @@ prompt it; a single member has no peers. Railway's private DNS can trail a
 container's start, so the entrypoint waits for `getent hosts` to answer before
 starting `mongod`, and restarts the service if it never does.
 
-Resolving is not enough, though. On a redeploy the private domain can keep
-answering with the *previous* container's address for a while. `getent` is
-satisfied, `mongod` tries to reach itself at an address where nothing answers
-any more, gives up after about 30 seconds, and settles into `REMOVED`:
+Resolving is not enough, though. On a redeploy the private domain keeps
+answering with the *previous* container's addresses for a few seconds. Railway's
+DNS logs show about nine seconds: the new container started at 08:47:27,
+`mongod` resolved its name at 08:47:27.9 and got the old address, and the
+record switched at 08:47:36. `getent` is satisfied, `mongod` tries to reach
+itself at an address where nothing answers any more, gives up after about 30
+seconds, and settles into `REMOVED`:
 
 ```
 Locally stored replica set configuration does not have a valid entry for the current node; waiting for reconfig or remote heartbeat
@@ -204,8 +207,18 @@ This node is not a member of the config
 
 The configuration is accepted, unlike after a rename (§5), and is perfectly
 correct; the node simply missed itself. A single member never receives the
-heartbeat it is waiting for, so it would stay there for good. Nothing can be
-checked before `mongod` is listening, so the recovery happens after it starts:
+heartbeat it is waiting for, so it would stay there for good.
+
+The first defence is to avoid it. Railway puts the service's private addresses
+on the container's own interface (`railnet0`), so after the name resolves the
+entrypoint also waits for it to resolve to one of `hostname -I`. That is the
+first thing `mongod` checks when it looks for itself, so once it holds,
+`mongod` finds itself without connecting anywhere. Behind NAT or a proxy it
+never holds, so that wait gives up after `MONGO_DNS_SETTLE_SEC` (60) and starts
+`mongod` anyway.
+
+The second defence recovers a node that started too early regardless, after
+`mongod` is up:
 
 - `rs.status()` failing with `InvalidReplicaSetConfig` (93) while the
   configuration's only member is exactly the advertised host is that case
@@ -223,7 +236,11 @@ checked before `mongod` is listening, so the recovery happens after it starts:
 The check also waits for `mongod` to finish loading its configuration first.
 While it does, `mongod` reports `NotYetInitialized` exactly like a node that
 will never accept its configuration, so judging it too early misdiagnoses a
-healthy boot. `rs.initiate()` makes the same name-reaches-this-node check
+healthy boot. Connection errors are retried as well. `mongod` closes every
+client connection when it changes state, and on Railway the check was in
+flight at exactly the moment the node went `REMOVED`. For the same reason, a
+lost reply to the reconfig does not count as a failure if the node recognises
+itself afterwards. `rs.initiate()` makes the same name-reaches-this-node check
 before it runs, because a service recreated under a just-deleted service's
 name can inherit that service's stale address.
 

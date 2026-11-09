@@ -24,12 +24,18 @@ that is a few seconds in which there is no database.
 `mongod` receives `SIGTERM` as PID 1 and shuts down cleanly; the new container
 starts, waits for its private domain to resolve, and elects itself PRIMARY.
 
-Sometimes the private domain still leads to the old container for a while
-after the new one starts. The new node then does not recognise itself at first.
-It waits for the name to catch up, re-applies its unchanged replica set
-configuration and elects itself PRIMARY, which can stretch the gap to a minute
-or two. The logs show `did not recognise itself in the replica set` followed
-by `Replica set configuration re-applied`, and nothing needs doing.
+After a redeploy, Railway's private DNS keeps returning the old container's
+addresses for a few seconds. The new container waits for the name to resolve
+to its own addresses before it starts `mongod`. The logs show
+`does not resolve to this container yet` and then `now resolves to this
+container`.
+
+If `mongod` starts too early anyway, the node first comes up without
+recognising itself. It waits for the name to reach it, re-applies its unchanged
+replica set configuration and elects itself PRIMARY, which can stretch the gap
+to a minute or two. The logs then show `did not recognise itself in the
+replica set` followed by `Replica set configuration re-applied`. Neither case
+needs anything from you.
 
 Drivers wait for a server for up to 30 seconds by default
 (`serverSelectionTimeoutMS`) and retry an interrupted operation once, so
